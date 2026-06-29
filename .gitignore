@@ -1,0 +1,48 @@
+# ─── Environment ───
+.env
+.env.local
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# ─── Node.js ───
+node_modules/
+.next/
+out/
+.vercel
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+
+# ─── Local Data & Logs ───
+*.log
+*.sqlite3
+*.db
+.cognee/
+.cognee_data/
+scratch_*.py
+
+# ─── Testing ───
+.pytest_cache/
+coverage/
+.coverage
+
+/docs
