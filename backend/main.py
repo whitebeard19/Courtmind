@@ -64,11 +64,46 @@ def _register_contradictions(case_id: str, found: list[dict]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────
+# On-disk persistence so cases / contradictions / assertion cache SURVIVE a backend
+# restart or hot-reload (otherwise the case dropdown empties whenever the server reloads).
+# Cognee holds the document graph; this small JSON file holds the lightweight metadata.
+# ─────────────────────────────────────────────────────────────────
+_STATE_FILE = Path(__file__).resolve().parent / ".courtmind_state.json"
+
+
+def _save_state() -> None:
+    try:
+        import json
+        _STATE_FILE.write_text(json.dumps({
+            "cases": cases,
+            "contradictions_by_case": contradictions_by_case,
+            "assertion_cache": memory_store.export_cache(),
+        }), encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] main._save_state: {e}")
+
+
+def _load_state() -> None:
+    if not _STATE_FILE.exists():
+        return
+    try:
+        import json
+        data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        cases.update(data.get("cases", {}))
+        contradictions_by_case.update(data.get("contradictions_by_case", {}))
+        memory_store.import_cache(data.get("assertion_cache", {}))
+        print(f"[INFO] main: restored {len(cases)} case(s) from {_STATE_FILE.name}")
+    except Exception as e:
+        print(f"[WARN] main._load_state: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
 # App lifecycle — connect to Cognee Cloud on startup
 # ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_state()
     print("[INFO] main: Connecting to Cognee Cloud...")
     await connect_to_cloud()
     print("[INFO] main: Cognee Cloud connected.")
@@ -136,6 +171,7 @@ async def create_case(req: CreateCaseRequest) -> dict:
         "created_at": now,
     }
     cases[case_id] = case
+    _save_state()
     return {
         "case_id": case_id,
         "name": req.name,
@@ -178,6 +214,7 @@ async def ingest_document(req: IngestRequest) -> dict:
     result = final_state["result"]
     # Cache detected contradictions so /api/contradictions is reliable for the UI.
     _register_contradictions(req.case_id, result.get("contradictions", []))
+    _save_state()  # persist contradictions + assertion cache populated during ingest
     return result
 
 
@@ -226,10 +263,13 @@ async def get_contradictions(
         return {"contradictions": cached}
 
     # Cross-session fallback: parse stored CONTRADICTION chunks out of Cognee.
+    # Use retries=1 — this is a GET the frontend may poll, so it must NOT hang on the
+    # cold-search retry window. If the registry is empty it almost always means no
+    # contradictions were stored, so a single fast attempt (then []) is the right behavior.
     try:
         # Search Cognee for CONTRADICTION entries in this case's memory
         results = await memory_store.recall_chunks(
-            case_id, "CONTRADICTION contradicts conflicting statements", top_k=20
+            case_id, "CONTRADICTION contradicts conflicting statements", top_k=20, retries=1
         )
         contradiction_texts = [
             memory_store._extract_text(r)
@@ -274,6 +314,8 @@ async def archive_case(case_id: str) -> dict:
         if case_id in cases:
             cases[case_id]["status"] = "archived"
         contradictions_by_case.pop(case_id, None)
+        memory_store.clear_cached_assertions(case_id)
+        _save_state()
         return {"case_id": case_id, "status": "archived"}
     except Exception as e:
         print(f"[ERROR] main.archive_case: {e}")

@@ -60,25 +60,34 @@ Rules:
 
 CONTRADICTION_PROMPT = """You are a legal fact-checker. Your job is to determine whether two statements contradict each other.
 
-Two statements contradict each other if they cannot both be true at the same time about the same subject.
+Two statements contradict each other ONLY if they cannot both be true at the same time about the SAME fact, or the SAME single event or state.
+
+Critically, about times and dates:
+- Different timestamps for DIFFERENT events are NORMAL, not a contradiction. Events happen in sequence: a person arrives and later leaves; a truck arrives, then departs. Do not flag a contradiction merely because two statements mention different times.
+- Only treat differing times/dates as a contradiction when they describe the SAME single event or fact (e.g. one meeting given two different dates).
+- An arrival time earlier than a departure time is EXPECTED, never a contradiction.
 
 Examples of contradictions:
-- "The meeting was on Tuesday" vs "The meeting was on Thursday" -> contradicts
+- "The meeting was on Tuesday" vs "The meeting was on Thursday" -> contradicts (same meeting, conflicting date)
 - "Martinez signed the contract" vs "Martinez never signed any contract" -> contradicts
 
 Examples that do NOT contradict:
-- "Martinez attended the meeting" vs "Smith also attended the meeting" -> does not contradict
-- "The office is downtown" vs "The office has three floors" -> does not contradict
+- "Martinez attended the meeting" vs "Smith also attended the meeting" -> does not contradict (two people, both true)
+- "The office is downtown" vs "The office has three floors" -> does not contradict (different facts)
+- "The truck arrived at 2:00 PM" vs "The driver left at 3:15 PM" -> does not contradict (sequential events; arrival then later departure is expected)
+- "Reyes left the loading dock around 3:15 PM" vs "The truck arrived at 2:00 PM" -> does not contradict (arrival precedes departure normally)
 
-Return ONLY valid JSON in this exact structure:
+Reason about it FIRST, then state the boolean. Your "contradicts" value MUST be consistent with your "reason": if the reason concludes the statements are compatible, can both be true, are sequential/different events, or do not contradict, then "contradicts" MUST be false.
+
+Return ONLY valid JSON in this EXACT key order (reason first, so the boolean follows your reasoning):
 {
+  "reason": "One clear sentence: do these describe the same fact/event, and can both be true at once?",
   "contradicts": true or false,
-  "reason": "One clear sentence explaining why these statements do or do not contradict",
   "confidence": 0.0 to 1.0
 }
 
 Confidence guide:
-- 0.9-1.0: Direct factual contradiction, no ambiguity
+- 0.9-1.0: Direct factual contradiction about the same fact/event, no ambiguity
 - 0.7-0.9: Strong contradiction with minor possible interpretation difference
 - 0.5-0.7: Possible contradiction, context-dependent
 - Below 0.5: Not a contradiction"""

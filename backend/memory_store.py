@@ -19,12 +19,51 @@ from cognee import SearchType
 from typing import Any
 
 # ─────────────────────────────────────────────
+# Write-through assertion cache (per-case working set)
+# ─────────────────────────────────────────────
+# Cognee Cloud's search() has a variable eventual-consistency window after cognify(),
+# so retrieving freshly-stored assertions for ingest-time contradiction detection is
+# unreliable (sometimes returns nothing for several seconds). We keep an in-memory mirror
+# of every assertion text we store, keyed by case_id, and use THAT as the contradiction
+# candidate pool — instant and 100% reliable in-session. Cognee remains the persistent
+# store and powers query/brief/cross-session recall; this is just a fast working set.
+_assertion_cache: dict[str, list[str]] = {}
+
+
+def cache_assertion(case_id: str, text_payload: str) -> None:
+    _assertion_cache.setdefault(case_id, []).append(text_payload)
+
+
+def get_cached_assertions(case_id: str) -> list[dict]:
+    """Return cached assertions for a case as candidate dicts ({'text': payload})."""
+    return [{"text": t} for t in _assertion_cache.get(case_id, [])]
+
+
+def clear_cached_assertions(case_id: str) -> None:
+    _assertion_cache.pop(case_id, None)
+
+
+def export_cache() -> dict[str, list[str]]:
+    """Snapshot the assertion cache for on-disk persistence (see main.py state file)."""
+    return {k: list(v) for k, v in _assertion_cache.items()}
+
+
+def import_cache(data: dict) -> None:
+    """Restore the assertion cache from a persisted snapshot at startup."""
+    _assertion_cache.clear()
+    if data:
+        for k, v in data.items():
+            _assertion_cache[k] = list(v)
+
+
+# ─────────────────────────────────────────────
 # WRITE — store an assertion into case memory
 # ─────────────────────────────────────────────
 
 async def store_assertion(case_id: str, assertion: dict, source_doc: str) -> None:
     """
-    Stage one extracted assertion into this case's dataset via cognee.add().
+    Stage one extracted assertion into this case's dataset via cognee.add(), and mirror
+    it into the in-memory write-through cache (used for reliable contradiction candidates).
 
     NOTE: this only ADDS the raw text — it does NOT build the graph. Call build_graph()
     ONCE after staging all of a document's assertions. cognify() is the expensive step
@@ -37,11 +76,11 @@ async def store_assertion(case_id: str, assertion: dict, source_doc: str) -> Non
         f"[Date: {assertion.get('event_date') or 'unknown'}] "
         f"[Source: {source_doc}]"
     )
-    try:
-        await cognee.add(text_payload, dataset_name=case_id)
-    except Exception as e:
-        print(f"[ERROR] memory_store.store_assertion (case={case_id}): {e}")
-        raise
+    # Cache FIRST so contradiction detection has the assertion regardless of Cognee health.
+    # The cache is the authoritative source for real-time contradiction candidates.
+    cache_assertion(case_id, text_payload)
+    # Persist into Cognee's permanent knowledge graph via remember() (fire-and-forget).
+    schedule_remember(case_id, text_payload)
 
 
 async def store_contradiction(
@@ -57,24 +96,77 @@ async def store_contradiction(
         f"CONTRADICTION: '{assertion_a}' contradicts '{assertion_b}'. "
         f"Reason: {reason}. Confidence: {confidence}."
     )
+    # Persist the contradiction relationship into the graph via remember() (fire-and-forget).
+    schedule_remember(case_id, relationship_text)
+
+
+_bg_remember_tasks: set = set()
+
+
+async def _safe_remember(case_id: str, text: str) -> None:
     try:
-        await cognee.add(relationship_text, dataset_name=case_id)
+        await cognee.remember(text, dataset_name=case_id)
     except Exception as e:
-        print(f"[ERROR] memory_store.store_contradiction (case={case_id}): {e}")
-        raise
+        print(f"[WARN] memory_store remember failed (case={case_id}): {e}")
 
 
-async def build_graph(case_id: str) -> None:
+def schedule_remember(case_id: str, text: str) -> None:
+    """
+    Fire-and-forget cognee.remember() — the flagship ingestion op (ingest + permanent graph
+    structuring in one call). Returns immediately so persistence never blocks the ingest
+    response or contradiction detection (which reads the in-memory cache, not the graph).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_safe_remember(case_id, text))
+    _bg_remember_tasks.add(task)
+    task.add_done_callback(_bg_remember_tasks.discard)
+
+
+_bg_build_tasks: set = set()
+
+
+def schedule_build_graph(case_id: str) -> None:
+    """
+    Fire-and-forget graph build. Returns immediately so a slow/hanging cognify (e.g. Cognee
+    over budget) can NEVER block the ingest response or delay contradiction detection.
+    The build runs in the background purely for later query/brief persistence.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no running loop (e.g. called from sync context) — skip
+    task = loop.create_task(build_graph(case_id))
+    _bg_build_tasks.add(task)
+    task.add_done_callback(_bg_build_tasks.discard)
+
+
+async def build_graph(case_id: str, timeout: float = 30.0) -> None:
     """
     Build/refresh the knowledge graph for a case from everything staged via add().
-    Call ONCE per ingest after all assertions (and again after staging contradictions),
-    rather than once per assertion. This is the costly cloud operation.
+    Call ONCE per ingest after all assertions (and again after staging contradictions).
+
+    Best-effort and time-bounded: cognify() is the costly cloud op and can hang or retry
+    server-side for minutes when Cognee is unhealthy or its budget is exhausted (observed
+    ~275s before a 500). We bound the wait with `timeout` and NEVER raise — graph build is
+    only needed for persistence/query/brief, not for contradiction detection (which uses
+    the in-memory cache). A failed/timed-out build just means query/brief are degraded
+    until Cognee is healthy again.
     """
+    # run_in_background=True submits the graph-build job and returns without waiting for the
+    # (slow) server-side LLM processing — so a degraded/over-budget Cognee can't stall ingest.
+    # wait_for is a secondary bound in case the submit call itself is slow.
     try:
-        await cognee.cognify(datasets=[case_id])
+        await asyncio.wait_for(
+            cognee.cognify(datasets=[case_id], run_in_background=True),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        print(f"[WARN] memory_store.build_graph submit exceeded {timeout}s (case={case_id}) — continuing")
     except Exception as e:
-        print(f"[ERROR] memory_store.build_graph (case={case_id}): {e}")
-        raise
+        print(f"[WARN] memory_store.build_graph (case={case_id}) failed (non-fatal): {e}")
 
 
 # ─────────────────────────────────────────────
@@ -136,14 +228,15 @@ async def _search_chunks(case_id: str, query: str, top_k: int, retries: int = 5,
     return last
 
 
-async def recall_chunks(case_id: str, query: str, top_k: int = 10) -> list[Any]:
+async def recall_chunks(case_id: str, query: str, top_k: int = 10, retries: int = 5) -> list[Any]:
     """
-    Raw chunk retrieval — used for contradiction-candidate lookup and brief building.
-    Scoped to THIS case's dataset so cases never cross-contaminate. Retries on empty
-    results to ride out Cognee Cloud's cold-first-query window (see _search_chunks).
+    Raw chunk retrieval — used for brief building and the cross-session contradictions
+    fallback. Scoped to THIS case's dataset. Retries on empty results to ride out Cognee
+    Cloud's cold-query window; pass retries=1 for a fast, non-blocking single attempt
+    (e.g. a GET endpoint that must not hang).
     """
     try:
-        return (await _search_chunks(case_id, query, top_k))[:top_k]
+        return (await _search_chunks(case_id, query, top_k, retries=retries))[:top_k]
     except Exception as e:
         print(f"[ERROR] memory_store.recall_chunks (case={case_id}, query='{query}'): {e}")
         raise
@@ -151,12 +244,17 @@ async def recall_chunks(case_id: str, query: str, top_k: int = 10) -> list[Any]:
 
 async def recall_answer(case_id: str, query: str) -> list[Any]:
     """
-    Retrieval for user-facing Q&A and brief generation. Returns the case's stored
-    chunks (via search(CHUNKS)) so answer_builder.py / brief_generator.py can feed
-    them to Qwen for contradiction-aware synthesis. Uses a wider top_k so any stored
-    CONTRADICTION entries are included in the context.
+    User-facing Q&A retrieval via the flagship cognee.recall() — it auto-routes between
+    semantic similarity and graph traversal and returns a graph-completion answer that is
+    already contradiction-aware (it surfaces conflicting facts on its own). answer_builder.py
+    then frames it with Qwen. Falls back to raw CHUNKS search if recall() returns nothing.
     """
     try:
+        results = await cognee.recall(query_text=query, datasets=[case_id])
+        flat = _flatten_search(results)
+        if flat:
+            return flat
+        # Fallback: recall can be empty on a cold graph — try raw chunks.
         return await _search_chunks(case_id, query, top_k=20)
     except Exception as e:
         print(f"[ERROR] memory_store.recall_answer (case={case_id}, query='{query}'): {e}")

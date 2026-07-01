@@ -9,15 +9,38 @@
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(json.error || json.detail || `HTTP ${res.status}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 180000); // 180s timeout
+
+  try {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      ...options,
+    });
+    
+    let json;
+    try {
+      json = await res.json();
+    } catch (e) {
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+      return {} as T;
+    }
+
+    if (!res.ok) {
+      throw new Error(json?.error || json?.detail || `HTTP ${res.status}`);
+    }
+    return json as T;
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Request timed out (exceeded 3 minutes). Please try again.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return json as T;
 }
 
 // ── Types ──────────────────────────────────────────────────────

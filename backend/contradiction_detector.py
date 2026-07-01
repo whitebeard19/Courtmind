@@ -6,6 +6,7 @@ Does NOT call Cognee directly — uses memory_store.py for all memory operations
 Does NOT write contradictions to memory — that's memory_store.store_contradiction().
 """
 
+import re
 import json
 from qwen_client import infer
 from memory_store import (
@@ -14,6 +15,34 @@ from memory_store import (
 from prompts import CONTRADICTION_PROMPT
 
 CONFIDENCE_THRESHOLD = 0.7
+
+# Strips the "[Speaker: ...] [Date: ...] [Source: ...]" metadata that store_assertion()
+# bakes into the stored text. That metadata is ingestion context only — it must never
+# appear in the user-facing contradiction card (Bug 3).
+_TAG_RE = re.compile(r"\s*\[(?:Speaker|Date|Source):[^\]]*\]")
+
+# If the model's free-text reason concludes the statements are compatible, we must NOT
+# store it as a contradiction even if it returned contradicts=true (Bug 2: the reason and
+# the boolean disagreeing is the most damaging thing a judge can see).
+_HEDGE_PHRASES = (
+    "do not contradict", "does not contradict", "not contradict",
+    "do not strictly", "does not strictly", "not strictly contradict",
+    "can both be true", "could both be true", "both can be true",
+    "are compatible", "is compatible", "not a contradiction", "no contradiction",
+    "not necessarily contradict", "do not conflict", "does not conflict",
+    "sequential events", "different events",
+)
+
+
+def _clean_text(text: str) -> str:
+    """Remove ingestion metadata tags from an assertion string for display/comparison."""
+    return _TAG_RE.sub("", text or "").strip()
+
+
+def _reason_supports_contradiction(reason: str) -> bool:
+    """True unless the reason text hedges toward 'not a contradiction'."""
+    r = (reason or "").lower()
+    return not any(h in r for h in _HEDGE_PHRASES)
 
 
 async def detect_contradictions(
@@ -43,18 +72,17 @@ async def detect_contradictions(
         if not candidate_text or len(candidate_text.strip()) < 10:
             continue
 
-        # Strip metadata from candidate_text for Qwen comparison
-        # Metadata is always appended as " [Speaker: "
-        clean_candidate = candidate_text
-        if " [Speaker: " in clean_candidate:
-            clean_candidate = clean_candidate.split(" [Speaker: ")[0].strip()
+        # Strip ingestion metadata tags so both the Qwen comparison AND the stored/displayed
+        # text are clean (Bug 3).
+        clean_candidate = _clean_text(candidate_text)
+        clean_new = _clean_text(new_assertion_text)
 
         # Skip if the candidate IS the new assertion (self-comparison)
-        if clean_candidate == new_assertion_text.strip():
+        if clean_candidate == clean_new:
             continue
 
         prompt_input = (
-            f"Statement A: {new_assertion_text}\n"
+            f"Statement A: {clean_new}\n"
             f"Statement B: {clean_candidate}"
         )
 
@@ -68,15 +96,37 @@ async def detect_contradictions(
             print(f"[ERROR] contradiction_detector.detect_contradictions: {e}")
             continue
 
-        if result.get("contradicts") and result.get("confidence", 0) >= CONFIDENCE_THRESHOLD:
+        reason = result.get("reason", "")
+        is_contradiction = (
+            result.get("contradicts")
+            and result.get("confidence", 0) >= CONFIDENCE_THRESHOLD
+            # Guard (Bug 2): drop it if the reason text itself says it's NOT a contradiction.
+            and _reason_supports_contradiction(reason)
+        )
+        if is_contradiction:
             contradictions.append({
-                "assertion_a": new_assertion_text,
-                "assertion_b": candidate_text,
-                "reason": result["reason"],
+                "assertion_a": clean_new,
+                "assertion_b": clean_candidate,
+                "reason": reason,
                 "confidence": result["confidence"],
             })
 
     return contradictions
+
+
+def dedupe_contradictions(contradictions: list[dict]) -> list[dict]:
+    """
+    Collapse near-duplicate contradictions so the UI isn't flooded (Bug 4). When the same
+    candidate statement (assertion_b) is flagged by multiple new assertions, keep only the
+    single highest-confidence entry. Keyed on the normalized assertion_b text.
+    """
+    best: dict[str, dict] = {}
+    for c in contradictions:
+        key = " ".join((c.get("assertion_b") or "").lower().split())
+        if key not in best or c.get("confidence", 0) > best[key].get("confidence", 0):
+            best[key] = c
+    # Preserve highest-confidence-first ordering for the UI.
+    return sorted(best.values(), key=lambda c: c.get("confidence", 0), reverse=True)
 
 
 def _topical_query(new_assertion_text: str, assertion: dict) -> str:

@@ -39,6 +39,8 @@ Thumbs.db
 .cognee/
 .cognee_data/
 scratch_*.py
+.courtmind_state.json
+backend/.courtmind_state.json
 
 # ─── Testing ───
 .pytest_cache/

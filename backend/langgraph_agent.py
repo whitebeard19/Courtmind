@@ -14,7 +14,7 @@ import extractor
 import memory_store
 import answer_builder
 import brief_generator
-from contradiction_detector import detect_contradictions
+from contradiction_detector import detect_contradictions, dedupe_contradictions
 from prompts import INTENT_PROMPT
 
 
@@ -61,31 +61,13 @@ def classify_intent(state: AgentState) -> AgentState:
     return state
 
 
-def _pool_query(assertions: list[dict]) -> str:
-    """
-    Build ONE topical retrieval query for a document by unioning all assertions'
-    extracted entities (deduped, order-preserving). A topical noun-phrase query
-    reliably returns the case's stored chunks from Cognee; the verbatim sentence does
-    not (it triggers a conversational reply). Falls back to the first assertion's text.
-    """
-    seen: list[str] = []
-    for a in assertions:
-        for e in (a.get("entities") or []):
-            e = str(e).strip()
-            if e and e not in seen:
-                seen.append(e)
-    if seen:
-        return " ".join(seen)
-    return assertions[0]["text"] if assertions else ""
-
-
 async def ingest_node(state: AgentState) -> AgentState:
     """
     Full ingest pipeline — structured to call the expensive cloud ops ONCE per document
     instead of once per assertion (the key latency win):
       1. Extract assertions from document text (Qwen)
-      2. Stage ALL assertions via add(), then build_graph() ONCE
-      3. Recall the candidate pool ONCE (one search for the whole doc, not per assertion)
+      2. Stage ALL assertions via add() (mirrored into the cache), then build_graph() ONCE
+      3. Candidate pool = the case's cached assertions (reliable, instant — no Cognee search)
       4. For each assertion: Qwen contradiction judgment against the shared pool (no writes)
       5. Stage all confirmed contradictions via add(), then build_graph() ONCE
       6. Run improve/memify ONCE for staleness
@@ -111,39 +93,40 @@ async def ingest_node(state: AgentState) -> AgentState:
 
     all_contradictions: list[dict] = []
 
-    try:
-        # Step 2: stage every assertion, then build the graph ONCE
-        for assertion in assertions:
+    # IMPORTANT: contradiction detection (Qwen + the in-memory cache) is INDEPENDENT of
+    # Cognee's graph. It runs BEFORE any cognify() so a slow/hanging/over-budget Cognee can
+    # NEVER block or skip the centerpiece feature. cognify() is fire-and-forget at the end,
+    # purely for query/brief persistence.
+
+    # Step 2: stage every assertion — this caches it (used for detection) and add()s it to
+    # Cognee. NO cognify here; detection reads the cache, not the graph.
+    for assertion in assertions:
+        try:
             await memory_store.store_assertion(case_id, assertion, source_label)
-        if assertions:
-            await memory_store.build_graph(case_id)
+        except Exception as e:
+            print(f"[WARN] ingest_node store_assertion (cloud add) failed, assertion still cached: {e}")
 
-        # Step 3: recall the candidate pool ONCE for the whole document.
-        # A single topical query (union of all assertions' entities) returns the case's
-        # stored chunks; we reuse this pool for every assertion below. This keeps us to
-        # ONE Cognee search per ingest (the search has a costly cold-retry window), instead
-        # of one per assertion which previously blew past the request timeout.
-        pool_query = _pool_query(assertions)
-        candidate_pool: list = []
-        if assertions:
+    # Step 3: candidate pool from the in-memory write-through cache (reliable, instant)
+    candidate_pool: list = memory_store.get_cached_assertions(case_id)
+
+    # Step 4: contradiction judgment per assertion against the shared pool (no writes)
+    for assertion in assertions:
+        try:
+            contradictions = await detect_contradictions(
+                case_id, assertion["text"], candidate_pool
+            )
+            all_contradictions.extend(contradictions)
+        except Exception as e:
+            print(f"[ERROR] ingest_node contradiction check for '{assertion.get('text','')[:60]}': {e}")
+
+    # Collapse near-duplicate contradictions (same candidate flagged repeatedly) before
+    # storing/returning, so the UI stays clean (Bug 4).
+    all_contradictions = dedupe_contradictions(all_contradictions)
+
+    # Step 5: stage contradictions (add only).
+    if all_contradictions:
+        for c in all_contradictions:
             try:
-                candidate_pool = await memory_store.recall_chunks(case_id, pool_query, top_k=20)
-            except Exception as e:
-                print(f"[ERROR] langgraph_agent.ingest_node recall pool: {e}")
-
-        # Step 4: contradiction judgment per assertion against the shared pool (no writes)
-        for assertion in assertions:
-            try:
-                contradictions = await detect_contradictions(
-                    case_id, assertion["text"], candidate_pool
-                )
-                all_contradictions.extend(contradictions)
-            except Exception as e:
-                print(f"[ERROR] langgraph_agent.ingest_node contradiction check for '{assertion.get('text','')[:60]}': {e}")
-
-        # Step 4: stage all contradictions, then build the graph ONCE
-        if all_contradictions:
-            for c in all_contradictions:
                 await memory_store.store_contradiction(
                     case_id=case_id,
                     assertion_a=c["assertion_a"],
@@ -151,17 +134,16 @@ async def ingest_node(state: AgentState) -> AgentState:
                     reason=c["reason"],
                     confidence=c["confidence"],
                 )
-            await memory_store.build_graph(case_id)
+            except Exception as e:
+                print(f"[WARN] ingest_node store_contradiction (cloud add) failed: {e}")
 
-        # Step 5: enrichment + staleness pruning ONCE
-        try:
-            await memory_store.enrich_and_prune(case_id)
-        except Exception as e:
-            print(f"[ERROR] langgraph_agent.ingest_node enrich_and_prune: {e}")
+    # Note: persistence into Cognee's knowledge graph happens via remember() inside
+    # store_assertion()/store_contradiction() (fire-and-forget), so there's nothing to build
+    # here — contradictions are already detected + returned regardless of Cognee latency.
 
-    except Exception as e:
-        print(f"[ERROR] langgraph_agent.ingest_node: {e}")
-        state["error"] = str(e)
+    # Note: enrichment/staleness (improve/memify) is DISABLED — it 404s on the current Cognee
+    # tenant and is the lowest-priority feature (TEST_CASE #4). Re-enable via
+    # memory_store.enrich_and_prune(case_id) once improve() is confirmed working.
 
     state["result"] = {
         "assertions_extracted": len(assertions),

@@ -29,8 +29,10 @@ os.environ.setdefault("CACHING", "false")
 
 import cognee  # noqa: E402  (imported after CACHING is set)
 
-COGNEE_API_KEY: str = os.environ["COGNEE_API_KEY"]
-COGNEE_TENANT_URL: str = os.environ["COGNEE_TENANT_URL"]  # e.g. https://your-tenant.aws.cognee.ai
+# .strip() guards against stray whitespace in .env (e.g. "COGNEE_TENANT_URL= https://...")
+# which would otherwise produce an invalid URL and fail the connection.
+COGNEE_API_KEY: str = os.environ["COGNEE_API_KEY"].strip()
+COGNEE_TENANT_URL: str = os.environ["COGNEE_TENANT_URL"].strip()  # e.g. https://your-tenant.aws.cognee.ai
 
 
 async def connect_to_cloud() -> None:
