@@ -78,7 +78,7 @@ export default function HomePage() {
         <div className="flex flex-wrap gap-3">
           {[
             "Cognee Cloud — persistent graph-vector memory",
-            "Qwen 2.5-72B — reasoning, extraction, contradiction detection",
+            "Qwen Plus — reasoning, extraction, contradiction detection",
             "LangGraph — agent orchestration",
             "FastAPI — REST backend",
             "Next.js 14 — frontend",

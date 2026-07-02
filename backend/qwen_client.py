@@ -36,7 +36,7 @@ def infer(
     max_tokens: int = 1000,
 ) -> str:
     """
-    Single entry point for all Qwen 2.5-72B inference calls.
+    Single entry point for all Qwen inference calls (default model: qwen-plus).
 
     Args:
         system_prompt: The system instruction string.

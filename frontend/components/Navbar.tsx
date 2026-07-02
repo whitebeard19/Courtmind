@@ -45,7 +45,7 @@ export function Navbar() {
           onChange={(id, name) => setActiveCase(id, name)} 
         />
         <div className="text-xs text-slate-500 hidden md:block">
-          Powered by Cognee Cloud + Qwen 2.5-72B
+          Powered by Cognee Cloud + Qwen Plus
         </div>
       </div>
     </nav>

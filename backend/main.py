@@ -328,6 +328,6 @@ async def root() -> dict:
         "name": "CourtMind API",
         "version": "1.0.0",
         "memory_layer": "Cognee Cloud",
-        "reasoning_layer": "Qwen 2.5-72B",
+        "reasoning_layer": "Qwen Plus",
         "docs": "/docs",
     }
