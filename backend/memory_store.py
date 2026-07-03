@@ -2,13 +2,13 @@
 memory_store.py — The ONLY file in this codebase that imports cognee.
 
 This module owns every Cognee Cloud operation:
-  remember()  → ingest + graph build in one call
-  recall()    → query memory (routes to best strategy automatically)
-  forget()    → surgically delete a dataset / case memory
-  improve()   → enrichment + staleness pruning (replaces memify)
+  remember()  -> ingest + structure into the knowledge graph in one call (queued per case)
+  recall()    -> query memory (auto-routes between semantic + graph traversal)
+  forget()    -> surgically delete a dataset / case memory
+  search()    -> low-level CHUNKS retrieval (used as a resilient recall fallback)
 
-  Legacy lower-level ops also available via cognee.add() / cognify() / search() / memify()
-  if needed for fine-grained control.
+  Note: cognee.improve()/memify() (enrichment) are not enabled on the current tenant, so
+  they are not used here (see BUILD_LOG).
 
 Rule: No other file may import cognee. All Cognee calls live here.
 """
@@ -18,9 +18,9 @@ import cognee
 from cognee import SearchType
 from typing import Any
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # Write-through assertion cache (per-case working set)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # Cognee Cloud's search() has a variable eventual-consistency window after cognify(),
 # so retrieving freshly-stored assertions for ingest-time contradiction detection is
 # unreliable (sometimes returns nothing for several seconds). We keep an in-memory mirror
@@ -56,19 +56,17 @@ def import_cache(data: dict) -> None:
             _assertion_cache[k] = list(v)
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # WRITE — store an assertion into case memory
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 async def store_assertion(case_id: str, assertion: dict, source_doc: str) -> None:
     """
-    Stage one extracted assertion into this case's dataset via cognee.add(), and mirror
-    it into the in-memory write-through cache (used for reliable contradiction candidates).
-
-    NOTE: this only ADDS the raw text — it does NOT build the graph. Call build_graph()
-    ONCE after staging all of a document's assertions. cognify() is the expensive step
-    (~15s/call cloud-side); batching it per-document instead of per-assertion is the
-    single biggest ingest-latency win.
+    Store one extracted assertion for a case:
+      1. mirror it into the in-memory write-through cache (used for reliable, instant
+         contradiction candidates — independent of Cognee latency), and
+      2. queue a cognee.remember() write into the case's permanent knowledge graph
+         (serialized per case, non-blocking — see schedule_remember / flush_writes).
     """
     text_payload = (
         f"{assertion['text']} "
@@ -88,41 +86,75 @@ async def store_contradiction(
     reason: str, confidence: float
 ) -> None:
     """
-    Stage a detected contradiction relationship into the case's dataset via cognee.add().
-    Like store_assertion(), this does NOT cognify — call build_graph() once afterward.
-    Storing as structured text lets Cognee include it in future graph traversals.
+    Persist a detected contradiction relationship into the case's knowledge graph via a
+    queued cognee.remember() write. Storing it as structured text lets Cognee include the
+    contradiction in future graph traversals and cross-session recall.
     """
     relationship_text = (
         f"CONTRADICTION: '{assertion_a}' contradicts '{assertion_b}'. "
         f"Reason: {reason}. Confidence: {confidence}."
     )
-    # Persist the contradiction relationship into the graph via remember() (fire-and-forget).
+    # Persist the contradiction relationship into the graph via remember() (queued write).
     schedule_remember(case_id, relationship_text)
 
 
-_bg_remember_tasks: set = set()
+# ---------------------------------------------
+# Per-case write serialization + flush
+# ---------------------------------------------
+# remember() persistence is scheduled off the request path so ingest returns fast, BUT:
+#   1. writes for a case must be SERIALIZED — concurrent remember() to the same (possibly
+#      brand-new) dataset race on dataset creation (observed 409 ProgrammingError) and can
+#      produce duplicate/unstable graph state. A per-case lock guarantees one write at a time.
+#   2. reads (query/brief) must FLUSH pending writes for the case first, so they never recall
+#      a half-written memory. flush_writes() awaits everything queued for the case.
+_write_locks: dict[str, asyncio.Lock] = {}
+_pending_writes: dict[str, set] = {}
 
 
-async def _safe_remember(case_id: str, text: str) -> None:
-    try:
-        await cognee.remember(text, dataset_name=case_id)
-    except Exception as e:
-        print(f"[WARN] memory_store remember failed (case={case_id}): {e}")
+def _write_lock(case_id: str) -> asyncio.Lock:
+    lock = _write_locks.get(case_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _write_locks[case_id] = lock
+    return lock
+
+
+async def _serialized_remember(case_id: str, text: str) -> None:
+    async with _write_lock(case_id):
+        try:
+            await cognee.remember(text, dataset_name=case_id)
+        except Exception as e:
+            print(f"[WARN] memory_store remember failed (case={case_id}): {e}")
 
 
 def schedule_remember(case_id: str, text: str) -> None:
     """
-    Fire-and-forget cognee.remember() — the flagship ingestion op (ingest + permanent graph
-    structuring in one call). Returns immediately so persistence never blocks the ingest
-    response or contradiction detection (which reads the in-memory cache, not the graph).
+    Queue a cognee.remember() write for this case — the flagship ingestion op (ingest +
+    permanent graph structuring). Serialized per case (see above) and non-blocking: returns
+    immediately so persistence never blocks the ingest response or contradiction detection
+    (which reads the in-memory cache). Call flush_writes(case_id) before a read.
     """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    task = loop.create_task(_safe_remember(case_id, text))
-    _bg_remember_tasks.add(task)
-    task.add_done_callback(_bg_remember_tasks.discard)
+    task = loop.create_task(_serialized_remember(case_id, text))
+    _pending_writes.setdefault(case_id, set()).add(task)
+    task.add_done_callback(lambda t: _pending_writes.get(case_id, set()).discard(t))
+
+
+async def flush_writes(case_id: str, timeout: float = 90.0) -> None:
+    """
+    Wait for all pending remember() writes for this case to finish before a read, so
+    query/brief always recall a fully-written, consistent case memory. Bounded by `timeout`.
+    """
+    tasks = list(_pending_writes.get(case_id, set()))
+    if not tasks:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"[WARN] memory_store.flush_writes timed out (case={case_id})")
 
 
 _bg_build_tasks: set = set()
@@ -169,9 +201,9 @@ async def build_graph(case_id: str, timeout: float = 30.0) -> None:
         print(f"[WARN] memory_store.build_graph (case={case_id}) failed (non-fatal): {e}")
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # READ — retrieve memory from a case's dataset
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def _flatten_search(results: list[Any]) -> list[Any]:
     """
@@ -235,6 +267,10 @@ async def recall_chunks(case_id: str, query: str, top_k: int = 10, retries: int 
     Cloud's cold-query window; pass retries=1 for a fast, non-blocking single attempt
     (e.g. a GET endpoint that must not hang).
     """
+    # Flush pending writes for this case so we never read a half-written memory (unless a
+    # fast, non-retry read was explicitly requested — that path also skips the flush wait).
+    if retries > 1:
+        await flush_writes(case_id)
     try:
         return (await _search_chunks(case_id, query, top_k, retries=retries))[:top_k]
     except Exception as e:
@@ -246,19 +282,22 @@ async def recall_answer(case_id: str, query: str) -> list[Any]:
     """
     User-facing Q&A retrieval via the flagship cognee.recall() — it auto-routes between
     semantic similarity and graph traversal and returns a graph-completion answer that is
-    already contradiction-aware (it surfaces conflicting facts on its own). answer_builder.py
-    then frames it with Qwen. Falls back to raw CHUNKS search if recall() returns nothing.
+    already contradiction-aware. answer_builder.py then frames it with Qwen.
+
+    Robust recovery: flushes pending writes first, then tries recall(); if recall() errors
+    OR returns nothing, falls back to a retrying raw CHUNKS search. Only raises if BOTH the
+    recall and the search fallback fail — so the caller can fail loudly rather than fake success.
     """
+    await flush_writes(case_id)
     try:
         results = await cognee.recall(query_text=query, datasets=[case_id])
         flat = _flatten_search(results)
         if flat:
             return flat
-        # Fallback: recall can be empty on a cold graph — try raw chunks.
-        return await _search_chunks(case_id, query, top_k=20)
     except Exception as e:
-        print(f"[ERROR] memory_store.recall_answer (case={case_id}, query='{query}'): {e}")
-        raise
+        print(f"[WARN] memory_store.recall_answer recall() failed, falling back to search: {e}")
+    # Fallback: retrying raw CHUNKS search. Raises if this also fails (→ HTTP 500 upstream).
+    return await _search_chunks(case_id, query, top_k=20)
 
 
 def _extract_text(result: Any) -> str:
@@ -300,9 +339,9 @@ def format_recall_results(results: list[Any]) -> str:
     return "\n".join(lines) if lines else "(No relevant memory found)"
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # ENRICH — run improve() / memify() for staleness
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 async def enrich_and_prune(case_id: str) -> None:
     """
@@ -322,9 +361,9 @@ async def enrich_and_prune(case_id: str) -> None:
         raise
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # DELETE — archive / forget a case's memory
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 async def archive_case(case_id: str) -> None:
     """
@@ -343,9 +382,9 @@ async def archive_case(case_id: str) -> None:
         raise
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # PIPELINE — full ingest pipeline for one assertion
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 async def post_ingest_pipeline(
     case_id: str,

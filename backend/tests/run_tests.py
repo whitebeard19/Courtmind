@@ -1,5 +1,5 @@
 """
-run_tests.py — Master test runner for CourtMind Day 1 & Day 2 deliverables.
+run_tests.py - Master test runner for CourtMind Day 1 and Day 2 deliverables.
 
 Usage (from courtmind/backend/):
   python tests/run_tests.py              # Run all tests
@@ -10,9 +10,9 @@ Usage (from courtmind/backend/):
   python tests/run_tests.py pipeline     # Full pipeline via API (Day 2)
 """
 
+import os
 import subprocess
 import sys
-import os
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -37,7 +37,11 @@ def run_test(name: str, filename: str) -> bool:
     result = subprocess.run(
         [sys.executable, str(TESTS_DIR / filename)],
         cwd=str(BACKEND_DIR),
-        env={**os.environ, "PYTHONPATH": str(BACKEND_DIR)},
+        env={
+            **os.environ,
+            "PYTHONPATH": str(BACKEND_DIR),
+            "PYTHONIOENCODING": os.environ.get("PYTHONIOENCODING", "utf-8"),
+        },
     )
     return result.returncode == 0
 
@@ -46,7 +50,6 @@ def main():
     args = sys.argv[1:]
 
     if args:
-        # Run specific tests
         tests_to_run = []
         for arg in args:
             if arg in TEST_MAP:
@@ -56,11 +59,10 @@ def main():
                 print(f"Available: {', '.join(TEST_MAP.keys())}")
                 sys.exit(1)
     else:
-        # Run all tests in order
         tests_to_run = list(TEST_MAP.items())
 
     print(SEPARATOR)
-    print("CourtMind — Test Suite Runner")
+    print("CourtMind - Test Suite Runner")
     print(f"Tests: {', '.join(name for name, _ in tests_to_run)}")
     print(SEPARATOR)
 
@@ -68,16 +70,15 @@ def main():
     for name, filename in tests_to_run:
         results[name] = run_test(name, filename)
 
-    # Summary
-    print(f"\n\n{'='*60}")
+    print(f"\n\n{'=' * 60}")
     print("TEST RESULTS SUMMARY")
     print("=" * 60)
     for name, passed in results.items():
-        status = "✅ PASS" if passed else "❌ FAIL"
+        status = "[PASS]" if passed else "[FAIL]"
         print(f"  {status}  {name}")
 
     all_passed = all(results.values())
-    print(f"\n{'✅ ALL TESTS PASSED' if all_passed else '❌ SOME TESTS FAILED'}")
+    print(f"\n{'[PASS] ALL TESTS PASSED' if all_passed else '[FAIL] SOME TESTS FAILED'}")
     print("=" * 60)
 
     sys.exit(0 if all_passed else 1)
