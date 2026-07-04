@@ -46,7 +46,3 @@ backend/.courtmind_state.json
 .pytest_cache/
 coverage/
 .coverage
-
-
-/docs
-BLOG.md

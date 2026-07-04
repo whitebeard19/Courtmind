@@ -1,0 +1,4 @@
+# Nixpacks build config for the CourtMind FastAPI backend on Railway.
+# libmagic1 is required by cognee's file-type detection on Linux (python-magic).
+[phases.setup]
+aptPkgs = ["libmagic1"]
